@@ -2,23 +2,25 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import random
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_API_KEY, CONF_HOST
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_WATCHED_ALBUMS
+from .const import CONF_WATCHED_ALBUMS, DOMAIN
 from .hub import ImmichHub
 
 SCAN_INTERVAL = timedelta(minutes=5)
 
 # How often to refresh the list of available asset IDs
 _ID_LIST_REFRESH_INTERVAL = timedelta(hours=12)
+
+# Max retries when downloading an image before giving up
+_MAX_DOWNLOAD_RETRIES = 5
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,9 +32,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up Immich image platform."""
 
-    hub = ImmichHub(
-        host=config_entry.data[CONF_HOST], api_key=config_entry.data[CONF_API_KEY]
-    )
+    hub: ImmichHub = hass.data[DOMAIN][config_entry.entry_id]
 
     # Create entity for random favorite image
     async_add_entities([ImmichImageFavorite(hass, hub)])
@@ -65,10 +65,6 @@ class BaseImmichImage(ImageEntity):
     # We want to get a new image every so often, as defined by the refresh interval
     _attr_should_poll = True
 
-    _current_image_bytes: bytes | None = None
-    _cached_available_asset_ids: list[str] | None = None
-    _available_asset_ids_last_updated: datetime | None = None
-
     def __init__(self, hass: HomeAssistant, hub: ImmichHub) -> None:
         """Initialize the Immich image entity."""
         super().__init__(hass=hass, verify_ssl=True)
@@ -76,6 +72,10 @@ class BaseImmichImage(ImageEntity):
         self.hass = hass
 
         self._attr_extra_state_attributes = {}
+        self._current_image_bytes: bytes | None = None
+        self._cached_available_asset_ids: list[str] | None = None
+        self._available_asset_ids_last_updated: datetime | None = None
+        self._load_lock = asyncio.Lock()
 
     async def async_update(self) -> None:
         """Force a refresh of the image."""
@@ -96,55 +96,65 @@ class BaseImmichImage(ImageEntity):
         """Get the asset id of the next image we want to display."""
         if (
             not self._available_asset_ids_last_updated
-            or (datetime.now() - self._available_asset_ids_last_updated)
+            or (datetime.now(tz=timezone.utc) - self._available_asset_ids_last_updated)
             > _ID_LIST_REFRESH_INTERVAL
         ):
-            # If we don't have any available asset IDs yet, or the list is stale, refresh it
             _LOGGER.debug("Refreshing available asset IDs")
             self._cached_available_asset_ids = await self._refresh_available_asset_ids()
-            self._available_asset_ids_last_updated = datetime.now()
+            self._available_asset_ids_last_updated = datetime.now(tz=timezone.utc)
 
         if not self._cached_available_asset_ids:
-            # If we still don't have any available asset IDs, that's a problem
             _LOGGER.error("No assets are available")
             return None
 
-        # Select random item in list
-        random_asset = random.choice(self._cached_available_asset_ids)
-
-        return random_asset
+        return random.choice(self._cached_available_asset_ids)
 
     async def _load_and_cache_next_image(self) -> None:
         """Download and cache the image."""
-        asset_bytes = None
+        async with self._load_lock:
+            asset_bytes = None
+            retries = 0
 
-        while not asset_bytes:
-            asset_id = await self._get_next_asset_id()
+            while not asset_bytes and retries < _MAX_DOWNLOAD_RETRIES:
+                asset_id = await self._get_next_asset_id()
 
-            if not asset_id:
-                return
+                if not asset_id:
+                    return
 
-            asset_bytes = await self.hub.download_asset(asset_id)
+                asset_bytes = await self.hub.download_asset(asset_id)
+
+                if not asset_bytes:
+                    retries += 1
+                    _LOGGER.warning(
+                        "Failed to download asset %s (attempt %d/%d)",
+                        asset_id,
+                        retries,
+                        _MAX_DOWNLOAD_RETRIES,
+                    )
+                    await asyncio.sleep(1)
+                    continue
+
+                asset_info = await self.hub.get_asset_info(asset_id)
+
+                self._attr_extra_state_attributes["media_filename"] = (
+                    asset_info.get("originalFileName") or ""
+                )
+                self._attr_extra_state_attributes["media_exif"] = (
+                    asset_info.get("exifInfo") or ""
+                )
+                self._attr_extra_state_attributes["media_localdatetime"] = (
+                    asset_info.get("localDateTime") or ""
+                )
+
+                self._current_image_bytes = asset_bytes
+                self._attr_image_last_updated = datetime.now(tz=timezone.utc)
+                self.async_write_ha_state()
 
             if not asset_bytes:
-                await asyncio.sleep(1)
-                continue
-
-            asset_info = await self.hub.get_asset_info(asset_id)
-
-            self._attr_extra_state_attributes["media_filename"] = (
-                asset_info.get("originalFileName") or ""
-            )
-            self._attr_extra_state_attributes["media_exif"] = (
-                asset_info.get("exifInfo") or ""
-            )
-            self._attr_extra_state_attributes["media_localdatetime"] = (
-                asset_info.get("localDateTime") or ""
-            )
-
-            self._current_image_bytes = asset_bytes
-            self._attr_image_last_updated = datetime.now()
-            self.async_write_ha_state()
+                _LOGGER.error(
+                    "Failed to download image after %d attempts",
+                    _MAX_DOWNLOAD_RETRIES,
+                )
 
 
 class ImmichImageFavorite(BaseImmichImage):

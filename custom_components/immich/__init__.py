@@ -18,8 +18,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hub = ImmichHub(host=entry.data[CONF_HOST], api_key=entry.data[CONF_API_KEY])
 
-    if not await hub.authenticate():
-        raise InvalidAuth
+    try:
+        if not await hub.authenticate():
+            raise InvalidAuth
+    except Exception:
+        await hub.close()
+        raise
 
     hass.data[DOMAIN][entry.entry_id] = hub
 
@@ -31,6 +35,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hub: ImmichHub = hass.data[DOMAIN].pop(entry.entry_id)
+        await hub.close()
 
     return unload_ok
