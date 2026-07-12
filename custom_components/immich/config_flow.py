@@ -28,28 +28,27 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect.
-
-    Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
-    """
+    """Validate the user input allows us to connect."""
 
     url = url_normalize(data[CONF_HOST])
     api_key = data[CONF_API_KEY]
 
     hub = ImmichHub(host=url, api_key=api_key)
 
-    if not await hub.authenticate():
-        raise InvalidAuth
+    try:
+        if not await hub.authenticate():
+            raise InvalidAuth
 
-    user_info = await hub.get_my_user_info()
-    username = user_info["name"]
-    clean_hostname = urlparse(url).hostname
+        user_info = await hub.get_my_user_info()
+        username = user_info["name"]
+        clean_hostname = urlparse(url).hostname
 
-    # Return info that you want to store in the config entry.
-    return {
-        "title": f"{username} @ {clean_hostname}",
-        "data": {CONF_HOST: url, CONF_API_KEY: api_key},
-    }
+        return {
+            "title": f"{username} @ {clean_hostname}",
+            "data": {CONF_HOST: url, CONF_API_KEY: api_key},
+        }
+    finally:
+        await hub.close()
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -107,29 +106,32 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         api_key = self.config_entry.data[CONF_API_KEY]
         hub = ImmichHub(host=url, api_key=api_key)
 
-        if not await hub.authenticate():
-            raise InvalidAuth
+        try:
+            if not await hub.authenticate():
+                raise InvalidAuth
 
-        # Get the list of albums and create a mapping of album id to album name
-        albums = await hub.list_all_albums()
-        album_map = {album["id"]: album["albumName"] for album in albums}
+            # Get the list of albums and create a mapping of album id to album name
+            albums = await hub.list_all_albums()
+            album_map = {album["id"]: album["albumName"] for album in albums}
 
-        # Filter out any album ids that are no longer returned by the API
-        current_albums_value = [
-            album
-            for album in self.config_entry.options.get(CONF_WATCHED_ALBUMS, [])
-            if album in album_map
-        ]
+            # Filter out any album ids that are no longer returned by the API
+            current_albums_value = [
+                album
+                for album in self.config_entry.options.get(CONF_WATCHED_ALBUMS, [])
+                if album in album_map
+            ]
 
-        # Allow the user to select which albums they want to create entities for
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_WATCHED_ALBUMS,
-                        default=current_albums_value,
-                    ): cv.multi_select(album_map)
-                }
-            ),
-        )
+            # Allow the user to select which albums they want to create entities for
+            return self.async_show_form(
+                step_id="init",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(
+                            CONF_WATCHED_ALBUMS,
+                            default=current_albums_value,
+                        ): cv.multi_select(album_map)
+                    }
+                ),
+            )
+        finally:
+            await hub.close()
